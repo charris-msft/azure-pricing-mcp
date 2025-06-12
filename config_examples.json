@@ -1,0 +1,57 @@
+{
+  "configurations": {
+    "claude_desktop": {
+      "description": "Configuration for Claude Desktop MCP servers",
+      "file_location": "Claude Desktop config file (varies by OS)",
+      "config": {
+        "mcpServers": {
+          "azure-pricing": {
+            "command": "python",
+            "args": ["-m", "azure_pricing_server"],
+            "cwd": "C:\\git\\mcp\\azure_pricing"
+          }
+        }
+      }
+    },
+    "vscode": {
+      "description": "Configuration for VS Code MCP integration",
+      "file_location": "VS Code settings.json",
+      "config": {
+        "mcp": {
+          "servers": {
+            "azure-pricing": {
+              "command": "python",
+              "args": ["-m", "azure_pricing_server"],
+              "cwd": "C:\\git\\mcp\\azure_pricing"
+            }
+          }
+        },
+        "chat.mcp.discovery.enabled": true
+      }
+    }
+  },
+  "setup_instructions": {
+    "claude_desktop": [
+      "1. Locate your Claude Desktop config file:",
+      "   - Windows: %APPDATA%/Claude/claude_desktop_config.json",
+      "   - macOS: ~/Library/Application Support/Claude/claude_desktop_config.json",
+      "   - Linux: ~/.config/claude/claude_desktop_config.json",
+      "2. Add the 'mcpServers' configuration from above",
+      "3. Update the 'cwd' path to match your installation directory",
+      "4. Restart Claude Desktop"
+    ],
+    "vscode": [
+      "1. Open VS Code settings (Ctrl/Cmd + ,)",
+      "2. Click 'Open Settings (JSON)' in the top right",
+      "3. Add the MCP configuration from above",
+      "4. Update the 'cwd' path to match your installation directory",
+      "5. Restart VS Code",
+      "6. The Azure Pricing tools should appear in GitHub Copilot Chat"
+    ]
+  },
+  "notes": {
+    "paths": "Update the 'cwd' path to match your actual installation directory",
+    "python": "Ensure Python is in your PATH or use full path to python executable",
+    "virtual_env": "If using a virtual environment, use the full path to the venv python executable"
+  }
+}
