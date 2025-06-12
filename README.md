@@ -5,7 +5,7 @@ A Model Context Protocol (MCP) server that provides tools for querying Azure ret
 ## 🚀 Quick Start
 
 1. **Clone/Download** this repository
-2. **Run setup**: `setup.bat` (Windows) or `python setup.py` (Linux/Mac)
+2. **Run setup**: `setup.ps1` (Windows PowerShell) or `python setup.py` (Cross-platform)
 3. **Configure Claude Desktop** (see [QUICK_START.md](QUICK_START.md))
 4. **Ask Claude**: "What's the price of a Standard_D2s_v3 VM in East US?"
 
@@ -25,15 +25,17 @@ A Model Context Protocol (MCP) server that provides tools for querying Azure ret
 | `azure_price_search` | Search Azure retail prices with filters | Find VM prices in specific regions |
 | `azure_price_compare` | Compare prices across regions/SKUs | Compare storage costs across regions |
 | `azure_cost_estimate` | Estimate costs based on usage | Calculate monthly costs for 8hr/day usage |
+| `azure_discover_skus` | Discover available SKUs for a service | Find all VM types for a service |
+| `azure_sku_discovery` | Intelligent SKU discovery with fuzzy matching | "Find app service plans" or "web app pricing" |
 
 ## 📋 Installation
 
 ### Automated Setup (Recommended)
 ```bash
-# Windows
-setup.bat
+# Windows PowerShell
+.\setup.ps1
 
-# Linux/Mac  
+# Cross-platform (Python)
 python setup.py
 ```
 
@@ -75,24 +77,25 @@ Once configured with Claude, you can ask:
 - **Cost Estimation**: "Estimate costs for running a D4s_v3 VM 12 hours per day"
 - **Savings**: "What are the reserved instance savings for virtual machines?"
 - **GPU Pricing**: "Show me all GPU-enabled VMs with pricing"
+- **Service Discovery**: "Find all App Service plan pricing" or "What storage options are available?"
+- **SKU Discovery**: "Show me all web app hosting plans"
 
 ## 🧪 Testing
 
-Test API connectivity:
+Test setup and connectivity:
 ```bash
-python test_api.py
-```
+# Windows PowerShell
+.\test_setup.ps1
 
-Test full MCP server:
-```bash
-.venv\Scripts\python.exe test_server.py
+# Cross-platform test
+python -m azure_pricing_server --test
 ```
 
 ## 📚 Documentation
 
 - **[QUICK_START.md](QUICK_START.md)** - Step-by-step setup guide
 - **[USAGE_EXAMPLES.md](USAGE_EXAMPLES.md)** - Detailed usage examples and API responses
-- **[claude_config_example.json](claude_config_example.json)** - Example Claude Desktop configuration
+- **[config_examples.json](config_examples.json)** - Example configurations for Claude Desktop and VS Code
 
 ## 🔌 API Integration
 
@@ -113,11 +116,13 @@ This server uses the official Azure Retail Prices API:
 - Automatic savings plan detection
 - Reserved instance pricing comparisons
 - Multi-region cost analysis
+- Intelligent SKU discovery for finding the best pricing options
 
 ### Developer Friendly
 - Comprehensive error handling
 - Detailed logging for troubleshooting
 - Flexible parameter support
+- Cross-platform setup scripts (PowerShell and Python)
 
 ## 🤝 Contributing
 
