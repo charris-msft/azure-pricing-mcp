@@ -592,9 +592,14 @@ class AzurePricingServer:
             # Convert sets to lists for JSON serialization
             for sku_data in skus.values():
                 sku_data["regions"] = list(sku_data["regions"])
-                # Keep only the cheapest price for summary
-                sku_data["min_price"] = min(p["price"] for p in sku_data["prices"] if p["price"] > 0)
-                sku_data["sample_unit"] = sku_data["prices"][0]["unit"]
+                # Keep only the cheapest price for summary - handle empty sequences
+                valid_prices = [p["price"] for p in sku_data["prices"] if p["price"] > 0]
+                if valid_prices:
+                    sku_data["min_price"] = min(valid_prices)
+                else:
+                    # If no valid prices > 0, use the first price (even if 0) or default to 0
+                    sku_data["min_price"] = sku_data["prices"][0]["price"] if sku_data["prices"] else 0
+                sku_data["sample_unit"] = sku_data["prices"][0]["unit"] if sku_data["prices"] else "Unknown"
             
             return {
                 "service_found": service_used,
@@ -784,7 +789,7 @@ async def handle_list_tools() -> List[Tool]:
     ]
 
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
+async def handle_call_tool(name: str, arguments: dict) -> list:
     """Handle tool calls."""
     
     try:
@@ -808,50 +813,42 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                             "savings_plans": item.get("savingsPlan", [])
                         })
                     
-                    return CallToolResult(
-                        content=[
+                    if result["count"] > 0:
+                        return [
                             TextContent(
                                 type="text",
                                 text=f"Found {result['count']} Azure pricing results:\n\n" +
                                      json.dumps(formatted_items, indent=2)
                             )
                         ]
-                    )
-                else:
-                    return CallToolResult(
-                        content=[
+                    else:
+                        return [
                             TextContent(
                                 type="text",
                                 text="No pricing results found for the specified criteria."
                             )
                         ]
-                    )
             
             elif name == "azure_price_compare":
                 result = await pricing_server.compare_prices(**arguments)
-                
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=f"Price comparison for {result['service_name']}:\n\n" +
-                                 json.dumps(result["comparisons"], indent=2)
-                        )
-                    ]
-                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Price comparison for {result['service_name']}:\n\n" +
+                             json.dumps(result["comparisons"], indent=2)
+                    )
+                ]
             
             elif name == "azure_cost_estimate":
                 result = await pricing_server.estimate_costs(**arguments)
                 
                 if "error" in result:
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=f"Error: {result['error']}"
-                            )
-                        ]
-                    )
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"Error: {result['error']}"
+                        )
+                    ]
                 
                 # Format cost estimate
                 estimate_text = f"""
@@ -883,14 +880,12 @@ On-Demand Pricing:
 - Savings: {plan['savings_percent']}% (${plan['annual_savings']} annually)
 """
                 
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=estimate_text
-                        )
-                    ]
-                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=estimate_text
+                    )
+                ]
             
             elif name == "azure_discover_skus":
                 result = await pricing_server.discover_skus(**arguments)
@@ -898,85 +893,20 @@ On-Demand Pricing:
                 # Format the response
                 skus = result.get("skus", [])
                 if skus:
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=f"Found {result['total_skus']} SKUs for {result['service_name']}:\n\n" +
-                                     json.dumps(skus, indent=2)
-                            )
-                        ]
-                    )
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"Found {result['total_skus']} SKUs for {result['service_name']}:\n\n" +
+                                 json.dumps(skus, indent=2)
+                        )
+                    ]
                 else:
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text="No SKUs found for the specified service."
-                            )
-                        ]
-                    )
-            
-            elif name == "azure_sku_discovery":
-                result = await pricing_server.discover_skus(**arguments)
-                
-                if result["skus"]:
-                    # Format the SKU discovery response
-                    response_text = f"Available SKUs for {result['service_name']}:\n\n"
-                    
-                    if result["region_filter"]:
-                        response_text += f"Filtered by region: {result['region_filter']}\n"
-                    
-                    response_text += f"Price type: {result['price_type']}\n"
-                    response_text += f"Total SKUs found: {result['total_skus']}\n\n"
-                    
-                    # Group SKUs by product family for better organization
-                    products = {}
-                    for sku in result["skus"]:
-                        product = sku.get("product_name", "Unknown Product")
-                        if product not in products:
-                            products[product] = []
-                        products[product].append(sku)
-                    
-                    # Display SKUs grouped by product
-                    for product, skus in products.items():
-                        response_text += f"**{product}:**\n"
-                        for sku in skus[:10]:  # Limit to first 10 per product to avoid overflow
-                            sku_name = sku.get("sku_name", "Unknown")
-                            arm_sku = sku.get("arm_sku_name", "")
-                            price = sku.get("sample_price", 0)
-                            unit = sku.get("unit_of_measure", "")
-                            regions = len(sku.get("available_regions", []))
-                            
-                            response_text += f"  • {sku_name}"
-                            if arm_sku and arm_sku != sku_name:
-                                response_text += f" ({arm_sku})"
-                            response_text += f" - ${price} per {unit}"
-                            if regions > 1:
-                                response_text += f" - Available in {regions} regions"
-                            response_text += "\n"
-                        
-                        if len(skus) > 10:
-                            response_text += f"  ... and {len(skus) - 10} more SKUs\n"
-                        response_text += "\n"
-                    
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=response_text
-                            )
-                        ]
-                    )
-                else:
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=f"No SKUs found for {result['service_name']} with the specified criteria."
-                            )
-                        ]
-                    )
+                    return [
+                        TextContent(
+                            type="text",
+                            text="No SKUs found for the specified service."
+                        )
+                    ]
             
             elif name == "azure_sku_discovery":
                 result = await pricing_server.discover_service_skus(**arguments)
@@ -1018,14 +948,12 @@ On-Demand Pricing:
                             response_text += "\n"
                         response_text += "\n"
                     
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=response_text
-                            )
-                        ]
-                    )
+                    return [
+                        TextContent(
+                            type="text",
+                            text=response_text
+                        )
+                    ]
                 else:
                     # Format suggestions when no exact match
                     suggestions = result.get("suggestions", [])
@@ -1062,37 +990,28 @@ On-Demand Pricing:
                         response_text += "• 'sql' or 'database' for SQL Database\n"
                         response_text += "• 'kubernetes' or 'aks' for Azure Kubernetes Service"
                     
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=response_text
-                            )
-                        ]
-                    )
-            
-            else:
-                return CallToolResult(
-                    content=[
+                    return [
                         TextContent(
                             type="text",
-                            text=f"Unknown tool: {name}"
+                            text=response_text
                         )
-                    ],
-                    isError=True
-                )
-    
+                    ]
+            
+            else:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Unknown tool: {name}"
+                    )
+                ]
     except Exception as e:
         logger.error(f"Error handling tool call {name}: {e}")
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=f"Error: {str(e)}"
-                )
-            ],
-            isError=True
-        )
+        return [
+            TextContent(
+                type="text",
+                text=f"Error: {str(e)}"
+            )
+        ]
 
 async def main():
     """Main entry point for the server."""
