@@ -51,21 +51,49 @@ class AzurePricingServer:
         if self.session:
             await self.session.close()
     
-    async def _make_request(self, url: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Make HTTP request to Azure Pricing API."""
+    async def _make_request(self, url: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Dict[str, Any]:
+        """Make HTTP request to Azure Pricing API with retry logic for rate limiting."""
         if not self.session:
             raise RuntimeError("HTTP session not initialized")
-            
-        try:
-            async with self.session.get(url, params=params) as response:
-                response.raise_for_status()
-                return await response.json()
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP request failed: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error during request: {e}")
-            raise
+        
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):  # 0, 1, 2, 3 (4 total attempts)
+            try:
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 429:  # Too Many Requests
+                        if attempt < max_retries:
+                            wait_time = 5 * (attempt + 1)  # 5, 10, 15 seconds
+                            logger.warning(f"Rate limited (429). Retrying in {wait_time} seconds... (attempt {attempt + 1}/{max_retries + 1})")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            # Last attempt failed, raise the error
+                            response.raise_for_status()
+                    
+                    response.raise_for_status()
+                    return await response.json()
+                    
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429 and attempt < max_retries:
+                    wait_time = 5 * (attempt + 1)
+                    logger.warning(f"Rate limited (429). Retrying in {wait_time} seconds... (attempt {attempt + 1}/{max_retries + 1})")
+                    await asyncio.sleep(wait_time)
+                    last_exception = e
+                    continue
+                else:
+                    logger.error(f"HTTP request failed: {e}")
+                    raise
+            except aiohttp.ClientError as e:
+                logger.error(f"HTTP request failed: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error during request: {e}")
+                raise
+        
+        # If we get here, all retries failed
+        if last_exception:
+            raise last_exception
     
     async def search_azure_prices(
         self,
@@ -75,9 +103,11 @@ class AzurePricingServer:
         sku_name: Optional[str] = None,
         price_type: Optional[str] = None,
         currency_code: str = "USD",
-        limit: int = 50
+        limit: int = 50,
+        discount_percentage: Optional[float] = None,
+        validate_sku: bool = True
     ) -> Dict[str, Any]:
-        """Search Azure retail prices with various filters."""
+        """Search Azure retail prices with various filters, SKU validation, and discount support."""
         
         # Build filter conditions
         filter_conditions = []
@@ -116,12 +146,150 @@ class AzurePricingServer:
         if len(items) > limit:
             items = items[:limit]
         
-        return {
+        # SKU validation and clarification
+        validation_info = {}
+        if validate_sku and sku_name and not items:
+            validation_info = await self._validate_and_suggest_skus(service_name, sku_name, currency_code)
+        elif validate_sku and sku_name and isinstance(items, list) and len(items) > 10:
+            # Too many results - provide clarification
+            validation_info["clarification"] = {
+                "message": f"Found {len(items)} SKUs matching '{sku_name}'. Consider being more specific.",
+                "suggestions": [item.get("skuName") for item in items[:5] if item and item.get("skuName")]
+            }
+        
+        # Apply discount if provided
+        if discount_percentage is not None and discount_percentage > 0 and isinstance(items, list):
+            items = self._apply_discount_to_items(items, discount_percentage)
+        
+        result = {
             "items": items,
-            "count": len(items),
+            "count": len(items) if isinstance(items, list) else 0,
             "has_more": bool(data.get("NextPageLink")),
             "currency": currency_code,
             "filters_applied": filter_conditions
+        }
+        
+        # Add discount info if applied
+        if discount_percentage is not None and discount_percentage > 0:
+            result["discount_applied"] = {
+                "percentage": discount_percentage,
+                "note": "Prices shown are after discount"
+            }
+        
+        # Add validation info if available
+        if validation_info:
+            result.update(validation_info)
+        
+        return result
+    
+    async def _validate_and_suggest_skus(
+        self,
+        service_name: Optional[str],
+        sku_name: str,
+        currency_code: str = "USD"
+    ) -> Dict[str, Any]:
+        """Validate SKU name and suggest alternatives if not found."""
+        
+        # Try to find similar SKUs
+        suggestions = []
+        
+        if service_name:
+            # Search for SKUs within the service
+            broad_search = await self.search_azure_prices(
+                service_name=service_name,
+                currency_code=currency_code,
+                limit=100,
+                validate_sku=False  # Avoid recursion
+            )
+            
+            # Find SKUs that partially match
+            sku_lower = sku_name.lower()
+            items = broad_search.get("items", [])
+            if items:  # Only process if items exist
+                for item in items:
+                    item_sku = item.get("skuName")
+                    if not item_sku:  # Skip items without SKU names
+                        continue
+                    item_sku_lower = item_sku.lower()
+                    if (sku_lower in item_sku_lower or 
+                        item_sku_lower in sku_lower or
+                        any(word in item_sku_lower for word in sku_lower.split() if word)):
+                        suggestions.append({
+                            "sku_name": item_sku,
+                            "product_name": item.get("productName", "Unknown"),
+                            "price": item.get("retailPrice", 0),
+                            "unit": item.get("unitOfMeasure", "Unknown"),
+                            "region": item.get("armRegionName", "Unknown")
+                        })
+        
+        # Remove duplicates and limit suggestions
+        seen_skus = set()
+        unique_suggestions = []
+        for suggestion in suggestions:
+            sku = suggestion["sku_name"]
+            if sku not in seen_skus:
+                seen_skus.add(sku)
+                unique_suggestions.append(suggestion)
+                if len(unique_suggestions) >= 5:
+                    break
+        
+        return {
+            "sku_validation": {
+                "original_sku": sku_name,
+                "found": False,
+                "message": f"SKU '{sku_name}' not found" + (f" in service '{service_name}'" if service_name else ""),
+                "suggestions": unique_suggestions
+            }
+        }
+    
+    def _apply_discount_to_items(self, items: List[Dict], discount_percentage: float) -> List[Dict]:
+        """Apply discount percentage to pricing items."""
+        if not items:
+            return []
+        
+        discounted_items = []
+        
+        for item in items:
+            discounted_item = item.copy()
+            
+            # Apply discount to retail price
+            if "retailPrice" in item and item["retailPrice"]:
+                original_price = item["retailPrice"]
+                discounted_price = original_price * (1 - discount_percentage / 100)
+                discounted_item["retailPrice"] = round(discounted_price, 6)
+                discounted_item["originalPrice"] = original_price
+            
+            # Apply discount to savings plans if present
+            if "savingsPlan" in item and item["savingsPlan"] and isinstance(item["savingsPlan"], list):
+                discounted_savings = []
+                for plan in item["savingsPlan"]:
+                    discounted_plan = plan.copy()
+                    if "retailPrice" in plan and plan["retailPrice"]:
+                        original_plan_price = plan["retailPrice"]
+                        discounted_plan_price = original_plan_price * (1 - discount_percentage / 100)
+                        discounted_plan["retailPrice"] = round(discounted_plan_price, 6)
+                        discounted_plan["originalPrice"] = original_plan_price
+                    discounted_savings.append(discounted_plan)
+                discounted_item["savingsPlan"] = discounted_savings
+            
+            discounted_items.append(discounted_item)
+        
+        return discounted_items
+    
+    async def get_customer_discount(self, customer_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get customer discount information. Currently returns 10% default discount for all customers."""
+        
+        # For now, return a default 10% discount for all customers
+        # In the future, this could be enhanced to query a customer database
+        
+        return {
+            "customer_id": customer_id or "default",
+            "discount_percentage": 10.0,
+            "discount_type": "standard",
+            "description": "Standard customer discount",
+            "valid_until": None,  # No expiration for standard discount
+            "applicable_services": "all",  # Applies to all Azure services
+            "note": "This is a default discount applied to all customers. Contact sales for enterprise discounts."
         }
     
     async def compare_prices(
@@ -129,13 +297,14 @@ class AzurePricingServer:
         service_name: str,
         sku_name: Optional[str] = None,
         regions: Optional[List[str]] = None,
-        currency_code: str = "USD"
+        currency_code: str = "USD",
+        discount_percentage: Optional[float] = None
     ) -> Dict[str, Any]:
         """Compare prices across different regions or SKUs."""
         
         comparisons = []
         
-        if regions:
+        if regions and isinstance(regions, list):
             # Compare across regions
             for region in regions:
                 try:
@@ -170,7 +339,8 @@ class AzurePricingServer:
             
             # Group by SKU
             sku_prices = {}
-            for item in result["items"]:
+            items = result.get("items", [])
+            for item in items:
                 sku = item.get("skuName")
                 if sku and sku not in sku_prices:
                     sku_prices[sku] = {
@@ -184,15 +354,33 @@ class AzurePricingServer:
             
             comparisons = list(sku_prices.values())
         
+        # Apply discount if provided
+        if discount_percentage is not None and discount_percentage > 0:
+            for comparison in comparisons:
+                if "retail_price" in comparison and comparison["retail_price"]:
+                    original_price = comparison["retail_price"]
+                    discounted_price = original_price * (1 - discount_percentage / 100)
+                    comparison["retail_price"] = round(discounted_price, 6)
+                    comparison["original_price"] = original_price
+        
         # Sort by price
         comparisons.sort(key=lambda x: x.get("retail_price", 0))
         
-        return {
+        result = {
             "comparisons": comparisons,
             "service_name": service_name,
             "currency": currency_code,
             "comparison_type": "regions" if regions else "skus"
         }
+        
+        # Add discount info if applied
+        if discount_percentage is not None and discount_percentage > 0:
+            result["discount_applied"] = {
+                "percentage": discount_percentage,
+                "note": "Prices shown are after discount"
+            }
+        
+        return result
     
     async def estimate_costs(
         self,
@@ -200,7 +388,8 @@ class AzurePricingServer:
         sku_name: str,
         region: str,
         hours_per_month: float = 730,  # Default to full month
-        currency_code: str = "USD"
+        currency_code: str = "USD",
+        discount_percentage: Optional[float] = None
     ) -> Dict[str, Any]:
         """Estimate monthly costs based on usage."""
         
@@ -224,6 +413,11 @@ class AzurePricingServer:
         item = result["items"][0]
         hourly_rate = item.get("retailPrice", 0)
         
+        # Apply discount if provided
+        if discount_percentage is not None and discount_percentage > 0:
+            original_hourly_rate = hourly_rate
+            hourly_rate = hourly_rate * (1 - discount_percentage / 100)
+        
         # Calculate estimates
         monthly_cost = hourly_rate * hours_per_month
         daily_cost = hourly_rate * 24
@@ -235,20 +429,34 @@ class AzurePricingServer:
         
         for plan in savings_plans:
             plan_hourly = plan.get("retailPrice", 0)
+            
+            # Apply discount to savings plan prices too
+            if discount_percentage is not None and discount_percentage > 0:
+                original_plan_hourly = plan_hourly
+                plan_hourly = plan_hourly * (1 - discount_percentage / 100)
+            
             plan_monthly = plan_hourly * hours_per_month
             plan_yearly = plan_monthly * 12
             savings_percent = ((hourly_rate - plan_hourly) / hourly_rate) * 100 if hourly_rate > 0 else 0
             
-            savings_estimates.append({
+            plan_data = {
                 "term": plan.get("term"),
-                "hourly_rate": plan_hourly,
-                "monthly_cost": plan_monthly,
-                "yearly_cost": plan_yearly,
+                "hourly_rate": round(plan_hourly, 6),
+                "monthly_cost": round(plan_monthly, 2),
+                "yearly_cost": round(plan_yearly, 2),
                 "savings_percent": round(savings_percent, 2),
                 "annual_savings": round((yearly_cost - plan_yearly), 2)
-            })
+            }
+            
+            # Add original prices if discount was applied
+            if discount_percentage is not None and discount_percentage > 0:
+                plan_data["original_hourly_rate"] = original_plan_hourly
+                plan_data["original_monthly_cost"] = round(original_plan_hourly * hours_per_month, 2)
+                plan_data["original_yearly_cost"] = round(original_plan_hourly * hours_per_month * 12, 2)
+            
+            savings_estimates.append(plan_data)
         
-        return {
+        result = {
             "service_name": service_name,
             "sku_name": item.get("skuName"),
             "region": region,
@@ -256,7 +464,7 @@ class AzurePricingServer:
             "unit_of_measure": item.get("unitOfMeasure"),
             "currency": currency_code,
             "on_demand_pricing": {
-                "hourly_rate": hourly_rate,
+                "hourly_rate": round(hourly_rate, 6),
                 "daily_cost": round(daily_cost, 2),
                 "monthly_cost": round(monthly_cost, 2),
                 "yearly_cost": round(yearly_cost, 2)
@@ -267,6 +475,19 @@ class AzurePricingServer:
             },
             "savings_plans": savings_estimates
         }
+        
+        # Add discount info and original prices if discount was applied
+        if discount_percentage is not None and discount_percentage > 0:
+            result["discount_applied"] = {
+                "percentage": discount_percentage,
+                "note": "All prices shown are after discount"
+            }
+            result["on_demand_pricing"]["original_hourly_rate"] = original_hourly_rate
+            result["on_demand_pricing"]["original_daily_cost"] = round(original_hourly_rate * 24, 2)
+            result["on_demand_pricing"]["original_monthly_cost"] = round(original_hourly_rate * hours_per_month, 2)
+            result["on_demand_pricing"]["original_yearly_cost"] = round(original_hourly_rate * hours_per_month * 12, 2)
+        
+        return result
 
     async def discover_skus(
         self,
@@ -666,6 +887,15 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "integer",
                         "description": "Maximum number of results (default: 50)",
                         "default": 50
+                    },
+                    "discount_percentage": {
+                        "type": "number",
+                        "description": "Discount percentage to apply to prices (e.g., 10 for 10% discount)"
+                    },
+                    "validate_sku": {
+                        "type": "boolean",
+                        "description": "Whether to validate SKU names and provide suggestions (default: true)",
+                        "default": true
                     }
                 }
             }
@@ -693,6 +923,10 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "Currency code (default: USD)",
                         "default": "USD"
+                    },
+                    "discount_percentage": {
+                        "type": "number",
+                        "description": "Discount percentage to apply to prices (e.g., 10 for 10% discount)"
                     }
                 },
                 "required": ["service_name"]
@@ -725,6 +959,10 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "Currency code (default: USD)",
                         "default": "USD"
+                    },
+                    "discount_percentage": {
+                        "type": "number",
+                        "description": "Discount percentage to apply to prices (e.g., 10 for 10% discount)"
                     }
                 },
                 "required": ["service_name", "sku_name", "region"]
@@ -785,6 +1023,19 @@ async def handle_list_tools() -> List[Tool]:
                 },
                 "required": ["service_hint"]
             }
+        ),
+        Tool(
+            name="get_customer_discount",
+            description="Get customer discount information. Returns default 10% discount for all customers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "customer_id": {
+                        "type": "string",
+                        "description": "Customer ID (optional, defaults to 'default' customer)"
+                    }
+                }
+            }
         )
     ]
 
@@ -795,47 +1046,143 @@ async def handle_call_tool(name: str, arguments: dict) -> list:
     try:
         async with pricing_server:
             if name == "azure_price_search":
+                # Always get customer discount and apply it
+                customer_discount = await pricing_server.get_customer_discount()
+                discount_percentage = customer_discount["discount_percentage"]
+                
+                # Add discount to arguments if not already specified
+                if "discount_percentage" not in arguments:
+                    arguments["discount_percentage"] = discount_percentage
+                
                 result = await pricing_server.search_azure_prices(**arguments)
                 
                 # Format the response
                 if result["items"]:
                     formatted_items = []
                     for item in result["items"]:
-                        formatted_items.append({
+                        formatted_item = {
                             "service": item.get("serviceName"),
                             "product": item.get("productName"),
                             "sku": item.get("skuName"),
                             "region": item.get("armRegionName"),
                             "location": item.get("location"),
-                            "price": item.get("retailPrice"),
+                            "discounted_price": item.get("retailPrice"),
                             "unit": item.get("unitOfMeasure"),
                             "type": item.get("type"),
                             "savings_plans": item.get("savingsPlan", [])
-                        })
+                        }
+                        
+                        # Add original price and savings if discount was applied
+                        if "originalPrice" in item:
+                            original_price = item["originalPrice"]
+                            discounted_price = item["retailPrice"]
+                            savings_amount = original_price - discounted_price
+                            
+                            formatted_item["original_price"] = original_price
+                            formatted_item["savings_amount"] = round(savings_amount, 6)
+                            formatted_item["savings_percentage"] = round((savings_amount / original_price * 100), 2) if original_price > 0 else 0
+                        
+                        formatted_items.append(formatted_item)
                     
                     if result["count"] > 0:
+                        response_text = f"Found {result['count']} Azure pricing results:\n\n"
+                        
+                        # Add discount information if applied
+                        if "discount_applied" in result:
+                            response_text += f"💰 **Customer Discount Applied: {result['discount_applied']['percentage']}%**\n"
+                            response_text += f"   {result['discount_applied']['note']}\n\n"
+                        
+                        # Add SKU validation info if present
+                        if "sku_validation" in result:
+                            validation = result["sku_validation"]
+                            response_text += f"⚠️ SKU Validation: {validation['message']}\n"
+                            if validation["suggestions"]:
+                                response_text += "🔍 Suggested SKUs:\n"
+                                for suggestion in validation["suggestions"][:3]:
+                                    response_text += f"   • {suggestion['sku_name']}: ${suggestion['price']} per {suggestion['unit']}\n"
+                                response_text += "\n"
+                        
+                        # Add clarification info if present
+                        if "clarification" in result:
+                            clarification = result["clarification"]
+                            response_text += f"ℹ️ {clarification['message']}\n"
+                            if clarification["suggestions"]:
+                                response_text += "Top matches:\n"
+                                for suggestion in clarification["suggestions"]:
+                                    response_text += f"   • {suggestion}\n"
+                                response_text += "\n"
+                        
+                        # Add summary of savings if discount was applied
+                        if "discount_applied" in result:
+                            total_original_cost = sum(item.get("original_price", 0) for item in formatted_items)
+                            total_discounted_cost = sum(item.get("discounted_price", 0) for item in formatted_items)
+                            total_savings = total_original_cost - total_discounted_cost
+                            
+                            if total_savings > 0:
+                                response_text += f"💰 **Total Savings Summary:**\n"
+                                response_text += f"   Original Total: ${total_original_cost:.6f}\n"
+                                response_text += f"   Discounted Total: ${total_discounted_cost:.6f}\n"
+                                response_text += f"   **You Save: ${total_savings:.6f}**\n\n"
+                        
+                        response_text += "**Detailed Pricing:**\n"
+                        response_text += json.dumps(formatted_items, indent=2)
+                        
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Found {result['count']} Azure pricing results:\n\n" +
-                                     json.dumps(formatted_items, indent=2)
+                                text=response_text
                             )
                         ]
                     else:
+                        # Handle case where items exist but count is 0 (shouldn't happen, but safety)
+                        response_text = "No valid pricing results found."
                         return [
                             TextContent(
                                 type="text",
-                                text="No pricing results found for the specified criteria."
+                                text=response_text
                             )
                         ]
+                else:
+                    response_text = "No pricing results found for the specified criteria."
+                    
+                    # Show discount info even when no results
+                    if "discount_applied" in result:
+                        response_text += f"\n\n💰 Note: Your {result['discount_applied']['percentage']}% customer discount would have been applied to any results."
+                    
+                    # Add SKU validation info if present
+                    if "sku_validation" in result:
+                        validation = result["sku_validation"]
+                        response_text += f"\n\n⚠️ {validation['message']}\n"
+                        if validation["suggestions"]:
+                            response_text += "\n🔍 Did you mean one of these SKUs?\n"
+                            for suggestion in validation["suggestions"][:5]:
+                                response_text += f"   • {suggestion['sku_name']}: ${suggestion['price']} per {suggestion['unit']}"
+                                if suggestion['region']:
+                                    response_text += f" (in {suggestion['region']})"
+                                response_text += "\n"
+                    
+                    return [
+                        TextContent(
+                            type="text",
+                            text=response_text
+                        )
+                    ]
             
             elif name == "azure_price_compare":
                 result = await pricing_server.compare_prices(**arguments)
+                
+                response_text = f"Price comparison for {result['service_name']}:\n\n"
+                
+                # Add discount information if applied
+                if "discount_applied" in result:
+                    response_text += f"💰 {result['discount_applied']['percentage']}% discount applied - {result['discount_applied']['note']}\n\n"
+                
+                response_text += json.dumps(result["comparisons"], indent=2)
+                
                 return [
                     TextContent(
                         type="text",
-                        text=f"Price comparison for {result['service_name']}:\n\n" +
-                             json.dumps(result["comparisons"], indent=2)
+                        text=response_text
                     )
                 ]
             
@@ -857,7 +1204,13 @@ Region: {result['region']}
 Product: {result['product_name']}
 Unit: {result['unit_of_measure']}
 Currency: {result['currency']}
+"""
 
+                # Add discount information if applied
+                if "discount_applied" in result:
+                    estimate_text += f"\n💰 {result['discount_applied']['percentage']}% discount applied - {result['discount_applied']['note']}\n"
+
+                estimate_text += f"""
 Usage Assumptions:
 - Hours per month: {result['usage_assumptions']['hours_per_month']}
 - Hours per day: {result['usage_assumptions']['hours_per_day']}
@@ -867,6 +1220,16 @@ On-Demand Pricing:
 - Daily Cost: ${result['on_demand_pricing']['daily_cost']}
 - Monthly Cost: ${result['on_demand_pricing']['monthly_cost']}
 - Yearly Cost: ${result['on_demand_pricing']['yearly_cost']}
+"""
+
+                # Add original pricing if discount was applied
+                if "discount_applied" in result and "original_hourly_rate" in result['on_demand_pricing']:
+                    estimate_text += f"""
+Original Pricing (before discount):
+- Hourly Rate: ${result['on_demand_pricing']['original_hourly_rate']}
+- Daily Cost: ${result['on_demand_pricing']['original_daily_cost']}
+- Monthly Cost: ${result['on_demand_pricing']['original_monthly_cost']}
+- Yearly Cost: ${result['on_demand_pricing']['original_yearly_cost']}
 """
                 
                 if result['savings_plans']:
@@ -878,6 +1241,12 @@ On-Demand Pricing:
 - Monthly Cost: ${plan['monthly_cost']}
 - Yearly Cost: ${plan['yearly_cost']}
 - Savings: {plan['savings_percent']}% (${plan['annual_savings']} annually)
+"""
+                        # Add original pricing for savings plans if discount was applied
+                        if "original_hourly_rate" in plan:
+                            estimate_text += f"""- Original Hourly Rate: ${plan['original_hourly_rate']}
+- Original Monthly Cost: ${plan['original_monthly_cost']}
+- Original Yearly Cost: ${plan['original_yearly_cost']}
 """
                 
                 return [
@@ -996,6 +1365,27 @@ On-Demand Pricing:
                             text=response_text
                         )
                     ]
+            
+            elif name == "get_customer_discount":
+                result = await pricing_server.get_customer_discount(**arguments)
+                
+                response_text = f"""Customer Discount Information
+                
+Customer ID: {result['customer_id']}
+Discount Type: {result['discount_type']}
+Discount Percentage: {result['discount_percentage']}%
+Description: {result['description']}
+Applicable Services: {result['applicable_services']}
+
+{result['note']}
+"""
+                
+                return [
+                    TextContent(
+                        type="text",
+                        text=response_text
+                    )
+                ]
             
             else:
                 return [
